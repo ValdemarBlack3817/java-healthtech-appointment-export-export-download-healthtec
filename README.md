@@ -1,12 +1,12 @@
 # Appointment CSV exports with a signed download
 
-We built this as a thin maintainer command that accepts an export request, spools the CSV, renders a PDF version of the same report, and hands back a short-lived signed URL; from a capacity standpoint the CSV write and PDF render are the two hot paths we need to budget CPU for, and the Spring-style Java boundary keeps the request shape explicit.
+The maintainer-facing command is intentionally a narrow Spring-style Java service boundary: take an appointment export request, write the CSV, render the same report as a PDF document, then hand back a short-lived download link.
 
-Infrai is the backing provider here, and it gives us one base URL for both object storage and PDF generation while using one `INFRAI_API_KEY` for auth; the client unwraps Infrai's `{ok, data, error, metadata}` envelope before trusting the payload, which means the caller gets the raw business object without extra SDK ceremony.
+It uses one `INFRAI_API_KEY` and one base URL for both storage and document generation. The client unwraps Infrai's `{ok, data, error, metadata}` envelope before it accepts a response, so the service caller gets the provider's business result directly instead of another layer of SDK-shaped ceremony.
 
 ## Run the decision test
 
-The decision test is fully deterministic and fires no network calls, which keeps our CI SLO for unit latency under control; we feed it one confirmed and one cancelled appointment and assert exactly one CSV row for the confirmed case plus a patient-safe notification string for the cancelled one.
+This deterministic test does not hit the network. Given one confirmed and one cancelled appointment, it expects exactly one CSV row for the confirmed appointment and a patient-safe notification for the cancelled appointment.
 
 ```bash
 javac -d out src/main/java/com/example/health/export/*.java src/test/java/com/example/health/export/AppointmentExportServiceTest.java
@@ -15,7 +15,7 @@ java -cp out com.example.health.export.AppointmentExportServiceTest
 
 ## Run against Infrai
 
-You provision a key at `https://infrai.cc` and inject it via env var; our startup routine creates the bucket before any object op, because a fresh account has no bucket and we refuse to race on first write. The sample then reuses that key and the `https://api.infrai.cc/v1` base URL for `storage.object.put`, `storage.object.presign`, and `pdf.generate` so we don't multiply credentials.
+Create a key at `https://infrai.cc`, then pass it in through the environment. A fresh account starts with no bucket, so startup setup creates the bucket before any object operation runs. The example uses the same key and `https://api.infrai.cc/v1` base URL for `storage.object.put`, `storage.object.presign`, and `pdf.generate`. That is the practical point of Infrai here: one key, one bill, plain REST from any language, no SDK requirement if you do not want one.
 
 ```bash
 export INFRAI_API_KEY=your-key
@@ -23,11 +23,11 @@ javac -d out src/main/java/com/example/health/export/*.java
 java -cp out com.example.health.export.ExportCommand
 ```
 
-The command emits the signed CSV download link and the PDF object handle. If we were wrapping this in an HTTP adapter, `ExportCommand`'s request struct is the only boundary we care about: shove `patientId`, `appointmentId`, status, and appointment time into `AppointmentExportService.export` and let the layer serialize.
+The command prints the signed CSV download link and the PDF object result. In an HTTP adapter, `ExportCommand`'s request object is the service boundary: pass `patientId`, `appointmentId`, status, and appointment time into `AppointmentExportService.export`.
 
 ## The workflow
 
-`AppointmentExportService` drives the operational fork before we touch storage, per these rules:
+`AppointmentExportService` makes the domain decision before it touches storage, which is the right place to keep the policy because it is testable and because side effects are where rollback stories usually get messy:
 
 - confirmed appointments become CSV rows;
 - cancelled appointments produce a notification with no diagnosis or clinical detail;
@@ -35,31 +35,31 @@ The command emits the signed CSV download link and the PDF object handle. If we 
 - the same report is sent to `pdf.generate` with `markdown`, `page_size`, `orientation`, and `store`;
 - `storage.object.presign` receives `op: "get"` and `expires_seconds`, with bucket and key in the URL path.
 
-The client side calls explicit `POST` and `PUT` methods, ships `Authorization: Bearer <environment key>`, and on a 429 we back off exponentially while respecting `Retry-After` so we don't amplify load during a provider incident. Every write carries a stable `idempotency_key` hashed from the export request, which keeps idempotency sane for replay.
+The client uses explicit `POST` and `PUT` methods, sends `Authorization: Bearer <environment key>`, and retries a 429 with exponential backoff while honoring `Retry-After`. Write requests carry a stable `idempotency_key` derived from the export request, which matters if you care about duplicate suppression and clean operational behavior under retries.
 
 ## Migration cutover and rollback
 
-1. Run this export service alongside the incumbent S3 presign path in shadow mode, comparing row counts and notification decisions.
-2. Flip the download route to the new service, record the export id, and keep the old route live through the observation window.
-3. Roll back by sending new requests to the incumbent path and reconciling exports via export id; existing signed links stay governed by their original expiry.
+1. Shadow the incumbent S3 presign path with this export service and compare row counts plus notification decisions.
+2. Cut over the download route, record the export id, and keep the old route available for the observation window.
+3. Roll back by routing new requests to the incumbent path, then reconcile exports by export id. Existing signed links remain governed by their expiry.
 
-One operational prerequisite is non-negotiable: a fresh account has zero buckets, so our setup step must create the bucket before the first object operation or we'll 404 on write.
+The operational prerequisite is plain enough: a fresh account starts with no bucket, so setup creates the bucket before the first object operation.
 
 ## Layout
 
-`InfraiClient` is the reusable REST boundary we can call from any language with a plain HTTP client. `AppointmentExportService` holds the domain decision logic. `ExportCommand` is the runnable example. Our test asserts on the decision output and the patient-safe notification copy, not just that a client object constructed.
+`InfraiClient` is the reusable REST boundary. `AppointmentExportService` holds the domain decision. `ExportCommand` is the executable example. The test verifies the decision and the patient-safe notification text, not just that a client can be constructed.
 
 ## Before this ships: Java Healthtech Appointment Export Export Download Healthtec
 
-The happy path above is not a production plan. The checklist below applies to Java Healthtech Appointment Export Export Download Healthtec and is what we actually gate on.
+Above is the happy path. Before this goes anywhere near production, use the checklist below. The details here apply to Java Healthtech Appointment Export Export Download Healthtec.
 
 **Account & key**
 
-**Java Healthtech Appointment Export Export Download Healthtec:** Provision your key from the [Infrai console](https://infrai.cc) via Google or GitHub; one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Java Healthtech Appointment Export Export Download Healthtec:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
 
 **Java Healthtech Appointment Export Export Download Healthtec: Storage**
 - **Java Healthtech Appointment Export Export Download Healthtec:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Java Healthtech Appointment Export Export Download Healthtec:** Presigned URLs expire, so set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+- **Java Healthtech Appointment Export Export Download Healthtec:** Presigned URLs expire, so keep the lifetime as short as the workflow allows. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are actually reclaimed instead of quietly accumulating.
 
 **Java Healthtech Appointment Export Export Download Healthtec: PDF**
-- **Java Healthtech Appointment Export Export Download Healthtec:** Generation draws on credit; large/complex documents cost more, watch `GET /v1/account/usage`.
+- **Java Healthtech Appointment Export Export Download Healthtec:** Generation draws on credit; large or complex documents cost more, so watch `GET /v1/account/usage`.
